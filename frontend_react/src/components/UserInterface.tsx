@@ -6,6 +6,7 @@ interface User {
   id: number;
   name: string;
   email: string;
+  description?: string;
 }
 
 interface UserInterfaceProps {
@@ -15,8 +16,8 @@ interface UserInterfaceProps {
 const UserInterface: React.FC<UserInterfaceProps> = ({ backendName }) => {
   const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
   const [users, setUsers] = useState<User[]>([]);
-  const [newUser, setNewUser] = useState({ name: '', email: '' });
-  const [updateUser, setUpdateUser] = useState({ id: '', name: '', email: '' });
+  const [newUser, setNewUser] = useState({ name: '', email: '', description: '' });
+  const [updateUser, setUpdateUser] = useState({ id: '', name: '', email: '', description: '' });
 
   // Define styles based on the backend name
   const backgroundColors: { [key: string]: string } = {
@@ -50,7 +51,7 @@ const UserInterface: React.FC<UserInterfaceProps> = ({ backendName }) => {
     try {
       const response = await axios.post(`${apiUrl}/api/${backendName}/users`, newUser);
       setUsers([response.data, ...users]);
-      setNewUser({ name: '', email: '' });
+      setNewUser({ name: '', email: '', description: '' });
     } catch (error) {
       console.error('Error creating user:', error);
     }
@@ -60,12 +61,12 @@ const UserInterface: React.FC<UserInterfaceProps> = ({ backendName }) => {
   const handleUpdateUser = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     try {
-      await axios.put(`${apiUrl}/api/${backendName}/users/${updateUser.id}`, { name: updateUser.name, email: updateUser.email });
-      setUpdateUser({ id: '', name: '', email: '' });
+      await axios.put(`${apiUrl}/api/${backendName}/users/${updateUser.id}`, { name: updateUser.name, email: updateUser.email, description: updateUser.description });
+      setUpdateUser({ id: '', name: '', email: '', description: '' });
       setUsers(
         users.map((user) => {
           if (user.id === parseInt(updateUser.id)) {
-            return { ...user, name: updateUser.name, email: updateUser.email };
+            return { ...user, name: updateUser.name, email: updateUser.email, description: updateUser.description };
           }
           return user;
         })
@@ -87,7 +88,7 @@ const UserInterface: React.FC<UserInterfaceProps> = ({ backendName }) => {
 
   return (
     <div className={`user-interface ${bgColor} ${backendName} w-full max-w-md p-4 my-4 rounded shadow`}>
-      <img src={`/${backendName}logo.svg`} alt={`${backendName} Logo`} className="w-20 h-20 mb-6 mx-auto" />
+      <img src={`Go-Logo_Yellow.png`} alt={`${backendName} Logo`} className="w-50 h-50 mb-6 mx-auto" />
       <h2 className="text-xl font-bold text-center text-white mb-6">{`${backendName.charAt(0).toUpperCase() + backendName.slice(1)} Backend`}</h2>
 
       {/* Form to add new user */}
@@ -104,6 +105,13 @@ const UserInterface: React.FC<UserInterfaceProps> = ({ backendName }) => {
           value={newUser.email}
           onChange={(e) => setNewUser({ ...newUser, email: e.target.value })}
           className="mb-2 w-full p-2 border border-gray-300 rounded"
+        />
+        <textarea
+          placeholder="Description"
+          value={newUser.description}
+          onChange={(e) => setNewUser({ ...newUser, description: e.target.value })}
+          className="mb-2 w-full p-2 border border-gray-300 rounded"
+          rows={3}
         />
         <button type="submit" className="w-full p-2 text-white bg-blue-500 rounded hover:bg-blue-600">
           Add User
@@ -129,6 +137,13 @@ const UserInterface: React.FC<UserInterfaceProps> = ({ backendName }) => {
           value={updateUser.email}
           onChange={(e) => setUpdateUser({ ...updateUser, email: e.target.value })}
           className="mb-2 w-full p-2 border border-gray-300 rounded"
+        />
+        <textarea
+          placeholder="New Description"
+          value={updateUser.description}
+          onChange={(e) => setUpdateUser({ ...updateUser, description: e.target.value })}
+          className="mb-2 w-full p-2 border border-gray-300 rounded"
+          rows={3}
         />
         <button type="submit" className="w-full p-2 text-white bg-green-500 rounded hover:bg-green-600">
           Update User

@@ -13,9 +13,10 @@ import (
 )
 
 type User struct {
-	Id    int    `json:"id"`
-	Name  string `json:"name"`
-	Email string `json:"email"`
+	Id          int    `json:"id"`
+	Name        string `json:"name"`
+	Email       string `json:"email"`
+	Description string `json:"description"`
 }
 
 // main function
@@ -28,7 +29,7 @@ func main() {
 	defer db.Close()
 
 	// create table if it doesn't exist
-	_, err = db.Exec("CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, name TEXT, email TEXT)")
+	_, err = db.Exec("CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, name TEXT, email TEXT, description TEXT)")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -76,7 +77,7 @@ func jsonContentTypeMiddleware(next http.Handler) http.Handler {
 // get all users
 func getUsers(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		rows, err := db.Query("SELECT * FROM users")
+		rows, err := db.Query("SELECT id, name, email, description FROM users")
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -85,8 +86,14 @@ func getUsers(db *sql.DB) http.HandlerFunc {
 		users := []User{} // array of users
 		for rows.Next() {
 			var u User
-			if err := rows.Scan(&u.Id, &u.Name, &u.Email); err != nil {
+			var desc sql.NullString
+			if err := rows.Scan(&u.Id, &u.Name, &u.Email, &desc); err != nil {
 				log.Fatal(err)
+			}
+			if desc.Valid {
+				u.Description = desc.String
+			} else {
+				u.Description = ""
 			}
 			users = append(users, u)
 		}
@@ -108,10 +115,16 @@ func getUser(db *sql.DB) http.HandlerFunc {
 		id := vars["id"]
 
 		var u User
-		err := db.QueryRow("SELECT * FROM users WHERE id = $1", id).Scan(&u.Id, &u.Name, &u.Email)
+		var desc sql.NullString
+		err := db.QueryRow("SELECT id, name, email, description FROM users WHERE id = $1", id).Scan(&u.Id, &u.Name, &u.Email, &desc)
 		if err != nil {
 			w.WriteHeader(http.StatusNotFound)
 			return
+		}
+		if desc.Valid {
+			u.Description = desc.String
+		} else {
+			u.Description = ""
 		}
 
 		json.NewEncoder(w).Encode(u)
@@ -124,10 +137,12 @@ func createUser(db *sql.DB) http.HandlerFunc {
 		var u User
 		json.NewDecoder(r.Body).Decode(&u)
 
-		err := db.QueryRow("INSERT INTO users (name, email) VALUES ($1, $2) RETURNING id", u.Name, u.Email).Scan(&u.Id)
+		err := db.QueryRow("INSERT INTO users (name, email, description) VALUES ($1, $2, $3) RETURNING id", u.Name, u.Email, u.Description).Scan(&u.Id)
 		if err != nil {
 			log.Fatal(err)
 		}
+
+		fmt.Println("User created: ", u)
 
 		json.NewEncoder(w).Encode(u)
 	}
@@ -143,16 +158,22 @@ func updateUser(db *sql.DB) http.HandlerFunc {
 		id := vars["id"]
 
 		// Execute the update query
-		_, err := db.Exec("UPDATE users SET name = $1, email = $2 WHERE id = $3", u.Name, u.Email, id)
+		_, err := db.Exec("UPDATE users SET name = $1, email = $2, description = $3 WHERE id = $4", u.Name, u.Email, u.Description, id)
 		if err != nil {
 			log.Fatal(err)
 		}
 
 		// Retrieve the updated user data from the database
 		var updatedUser User
-		err = db.QueryRow("SELECT id, name, email FROM users WHERE id = $1", id).Scan(&updatedUser.Id, &updatedUser.Name, &updatedUser.Email)
+		var desc sql.NullString
+		err = db.QueryRow("SELECT id, name, email, description FROM users WHERE id = $1", id).Scan(&updatedUser.Id, &updatedUser.Name, &updatedUser.Email, &desc)
 		if err != nil {
 			log.Fatal(err)
+		}
+		if desc.Valid {
+			updatedUser.Description = desc.String
+		} else {
+			updatedUser.Description = ""
 		}
 
 		// Send the updated user data in the response
@@ -167,7 +188,7 @@ func deleteUser(db *sql.DB) http.HandlerFunc {
 		id := vars["id"]
 
 		var u User
-		err := db.QueryRow("SELECT * FROM users WHERE id = $1", id).Scan(&u.Id, &u.Name, &u.Email)
+		err := db.QueryRow("SELECT id FROM users WHERE id = $1", id).Scan(&u.Id)
 		if err != nil {
 			w.WriteHeader(http.StatusNotFound)
 			return
