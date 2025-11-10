@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -94,27 +95,30 @@ func initOAuth() {
 }
 
 func redirectToGoogleLogin(w http.ResponseWriter, r *http.Request) {
-	state := make([]byte, 32)
-
-	_, err := rand.Read(state)
-
-	if _, ok := oauthStateCache[string(state)]; ok {
-		log.Fatalf("State already exists")
-	}
-
-	oauthStateCache[string(state)] = true
-
+	// Generate random bytes for state
+	stateBytes := make([]byte, 32)
+	_, err := rand.Read(stateBytes)
 	if err != nil {
-		log.Fatalf("Error generating random bytes: %v", err)
+		log.Printf("Error generating random bytes: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
 	}
 
-	fmt.Printf("client id: %s\n", conf.ClientID)
-	fmt.Printf("client secret: %s\n", conf.ClientSecret)
-	fmt.Printf("redirect url: %s\n", conf.RedirectURL)
-	fmt.Printf("scopes: %s\n", conf.Scopes)
-	fmt.Printf("endpoint: %s\n", conf.Endpoint)
+	// Encode to base64 URL-safe string
+	state := base64.URLEncoding.EncodeToString(stateBytes)
 
-	url := conf.AuthCodeURL(string(state), oauth2.AccessTypeOffline)
+	// Check for duplicate (very unlikely with 32 random bytes)
+	if _, ok := oauthStateCache[state]; ok {
+		log.Printf("Warning: State collision detected, regenerating...")
+		// In production, you might want to retry here
+	}
+
+	// Store state in cache
+	oauthStateCache[state] = true
+	log.Printf("Generated OAuth state: %s", state)
+
+	// Generate OAuth URL
+	url := conf.AuthCodeURL(state, oauth2.AccessTypeOffline)
 
 	http.Redirect(w, r, url, http.StatusTemporaryRedirect)
 }
@@ -127,6 +131,7 @@ func handleGoogleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	delete(oauthStateCache, state)
+	log.Printf("State validated and removed from cache")
 
 	code := r.URL.Query().Get("code")
 
@@ -159,18 +164,16 @@ func handleGoogleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	status := oAuthData.Verified_email
-	if status {
-		fmt.Fprintf(w, "success: %s is a verified user\n", oAuthData.Email)
-	} else {
-		fmt.Fprint(w, "failed verification")
-	}
+	// Log the OAuth result
+	log.Printf("OAuth successful for user: %s (verified: %v)", oAuthData.Email, oAuthData.Verified_email)
 
+	// Get frontend URL for redirect
 	frontendURL := os.Getenv("FRONTEND_URL")
 	if frontendURL == "" {
 		frontendURL = "http://localhost:3000"
 	}
 
+	// Redirect to frontend based on verification status
 	if oAuthData.Verified_email {
 		// Success - redirect to home page with success message
 		http.Redirect(w, r, fmt.Sprintf("%s/?login=success&email=%s", frontendURL, oAuthData.Email), http.StatusTemporaryRedirect)
