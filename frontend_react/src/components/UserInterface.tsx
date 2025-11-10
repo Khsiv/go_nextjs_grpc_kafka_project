@@ -90,6 +90,16 @@ const UserInterface: React.FC<UserInterfaceProps> = ({ backendName }) => {
     <div className={`user-interface ${bgColor} ${backendName} w-full max-w-md p-4 my-4 rounded shadow`}>
       <img src={`Go-Logo_Yellow.png`} alt={`${backendName} Logo`} className="w-50 h-50 mb-6 mx-auto" />
       <h2 className="text-xl font-bold text-center text-white mb-6">{`${backendName.charAt(0).toUpperCase() + backendName.slice(1)} Backend`}</h2>
+      
+      {/* Navigation to Login */}
+      <div className="mb-6 text-center">
+        <a
+          href="/login"
+          className="inline-block px-6 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 transition-colors shadow-md hover:shadow-lg"
+        >
+          Go to Login Page
+        </a>
+      </div>
 
       {/* Form to add new user */}
       <form onSubmit={createUser} className="mb-6 p-4 bg-blue-100 rounded shadow">

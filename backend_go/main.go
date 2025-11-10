@@ -1,12 +1,18 @@
 package main
 
 import (
+	"context"
+	"crypto/rand"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
+
+	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/google"
 
 	"github.com/gorilla/mux"
 	_ "github.com/lib/pq"
@@ -18,6 +24,18 @@ type User struct {
 	Email       string `json:"email"`
 	Description string `json:"description"`
 }
+
+type OAuthData struct {
+	Id             string `json:"id"`
+	Email          string `json:"email"`
+	Verified_email bool   `json:"verified_email"`
+	Picture        string `json:"picture"`
+}
+
+var (
+	oauthStateCache = make(map[string]bool)
+	conf            *oauth2.Config
+)
 
 // main function
 func main() {
@@ -34,6 +52,9 @@ func main() {
 		log.Fatal(err)
 	}
 
+	// initialize OAuth
+	initOAuth()
+
 	// create router
 	router := mux.NewRouter()
 	router.HandleFunc("/api/go/users", getUsers(db)).Methods("GET")
@@ -42,10 +63,121 @@ func main() {
 	router.HandleFunc("/api/go/users/{id}", updateUser(db)).Methods("PUT")
 	router.HandleFunc("/api/go/users/{id}", deleteUser(db)).Methods("DELETE")
 
+	router.HandleFunc("/api/go/auth/google", redirectToGoogleLogin).Methods("GET")
+	router.HandleFunc("/api/go/auth/google/callback", handleGoogleCallback).Methods("GET")
+
 	// wrap the router with CORS and JSON content type middlewares
 	enhancedRouter := enableCORS(jsonContentTypeMiddleware(router))
 	// start server
 	log.Fatal(http.ListenAndServe(":8000", enhancedRouter))
+}
+
+func initOAuth() {
+	// Initialize Google OAuth config
+	conf = &oauth2.Config{
+		ClientID:     os.Getenv("GOOGLE_CLIENT_ID"),
+		ClientSecret: os.Getenv("GOOGLE_CLIENT_SECRET"),
+		RedirectURL:  os.Getenv("GOOGLE_REDIRECT_URL"),
+		Scopes: []string{
+			"https://www.googleapis.com/auth/userinfo.email",
+			"https://www.googleapis.com/auth/userinfo.profile",
+		},
+		Endpoint: google.Endpoint,
+	}
+
+	fmt.Println("ClientID: ", conf.ClientID)
+	fmt.Println("ClientSecret: ", conf.ClientSecret)
+
+	if conf.ClientID == "" || conf.ClientSecret == "" {
+		log.Println("Warning: Google OAuth credentials not set. Please set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET environment variables.")
+	}
+}
+
+func redirectToGoogleLogin(w http.ResponseWriter, r *http.Request) {
+	state := make([]byte, 32)
+
+	_, err := rand.Read(state)
+
+	if _, ok := oauthStateCache[string(state)]; ok {
+		log.Fatalf("State already exists")
+	}
+
+	oauthStateCache[string(state)] = true
+
+	if err != nil {
+		log.Fatalf("Error generating random bytes: %v", err)
+	}
+
+	fmt.Printf("client id: %s\n", conf.ClientID)
+	fmt.Printf("client secret: %s\n", conf.ClientSecret)
+	fmt.Printf("redirect url: %s\n", conf.RedirectURL)
+	fmt.Printf("scopes: %s\n", conf.Scopes)
+	fmt.Printf("endpoint: %s\n", conf.Endpoint)
+
+	url := conf.AuthCodeURL(string(state), oauth2.AccessTypeOffline)
+
+	http.Redirect(w, r, url, http.StatusTemporaryRedirect)
+}
+
+func handleGoogleCallback(w http.ResponseWriter, r *http.Request) {
+	state := r.URL.Query().Get("state")
+
+	if _, ok := oauthStateCache[state]; !ok {
+		log.Fatalf("Invalid state: %s", state)
+		return
+	}
+	delete(oauthStateCache, state)
+
+	code := r.URL.Query().Get("code")
+
+	token, err := conf.Exchange(context.Background(), code)
+
+	if err != nil {
+		log.Fatalf("Error exchanging code for token: %v", err)
+		return
+	}
+
+	response, err := http.Get("https://www.googleapis.com/oauth2/v2/userinfo?access_token=" + token.AccessToken)
+
+	if err != nil {
+		log.Fatalf("Error getting user info: %v", err)
+		return
+	}
+
+	data, err := io.ReadAll(response.Body)
+
+	if err != nil {
+		log.Fatalf("Error reading response body: %v", err)
+		return
+	}
+
+	var oAuthData OAuthData
+	err = json.Unmarshal(data, &oAuthData)
+
+	if err != nil {
+		log.Fatalf("Error unmarshalling user info: %v", err)
+		return
+	}
+
+	status := oAuthData.Verified_email
+	if status {
+		fmt.Fprintf(w, "success: %s is a verified user\n", oAuthData.Email)
+	} else {
+		fmt.Fprint(w, "failed verification")
+	}
+
+	frontendURL := os.Getenv("FRONTEND_URL")
+	if frontendURL == "" {
+		frontendURL = "http://localhost:3000"
+	}
+
+	if oAuthData.Verified_email {
+		// Success - redirect to home page with success message
+		http.Redirect(w, r, fmt.Sprintf("%s/?login=success&email=%s", frontendURL, oAuthData.Email), http.StatusTemporaryRedirect)
+	} else {
+		// Failed - redirect to login page with error
+		http.Redirect(w, r, fmt.Sprintf("%s/login?error=verification_failed", frontendURL), http.StatusTemporaryRedirect)
+	}
 }
 
 func enableCORS(next http.Handler) http.Handler {
