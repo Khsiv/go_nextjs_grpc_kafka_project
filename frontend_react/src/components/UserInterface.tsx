@@ -1,5 +1,4 @@
 import React, { useState, useEffect } from 'react';
-import axios from 'axios';
 import CardComponent from './CardComponent';
 
 interface User {
@@ -31,12 +30,61 @@ const UserInterface: React.FC<UserInterfaceProps> = ({ backendName }) => {
   const bgColor = backgroundColors[backendName as keyof typeof backgroundColors] || 'bg-gray-200';
   const btnColor = buttonColors[backendName as keyof typeof buttonColors] || 'bg-gray-500 hover:bg-gray-600';
 
+  // Refresh access token
+  const refreshAccessToken = async (): Promise<boolean> => {
+    try {
+      const response = await fetch(`${apiUrl}/api/go/auth/refresh`, {
+        method: 'POST',
+        credentials: 'include', // Send cookies
+      });
+      return response.ok;
+    } catch (error) {
+      console.error('Token refresh failed:', error);
+      return false;
+    }
+  };
+
+  // API call wrapper with auto-refresh
+  const apiCall = async (url: string, options: RequestInit = {}): Promise<Response> => {
+    const response = await fetch(url, {
+      ...options,
+      credentials: 'include', // CRITICAL: Send cookies with request
+      headers: {
+        'Content-Type': 'application/json',
+        ...options.headers,
+      },
+    });
+
+    // If unauthorized (token expired), try to refresh
+    if (response.status === 401) {
+      const refreshed = await refreshAccessToken();
+      if (refreshed) {
+        // Retry the original request
+        return fetch(url, {
+          ...options,
+          credentials: 'include',
+          headers: {
+            'Content-Type': 'application/json',
+            ...options.headers,
+          },
+        });
+      } else {
+        // Refresh failed, redirect to login
+        window.location.href = '/';
+        throw new Error('Session expired');
+      }
+    }
+
+    return response;
+  };
+
   // Fetch users
   useEffect(() => {
     const fetchData = async () => {
       try {
-        const response = await axios.get(`${apiUrl}/api/${backendName}/users`);
-        setUsers(response.data.reverse());
+        const response = await apiCall(`${apiUrl}/api/${backendName}/users`);
+        const data = await response.json();
+        setUsers(data.reverse());
       } catch (error) {
         console.error('Error fetching data:', error);
       }
@@ -49,8 +97,12 @@ const UserInterface: React.FC<UserInterfaceProps> = ({ backendName }) => {
   const createUser = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     try {
-      const response = await axios.post(`${apiUrl}/api/${backendName}/users`, newUser);
-      setUsers([response.data, ...users]);
+      const response = await apiCall(`${apiUrl}/api/${backendName}/users`, {
+        method: 'POST',
+        body: JSON.stringify(newUser),
+      });
+      const data = await response.json();
+      setUsers([data, ...users]);
       setNewUser({ name: '', email: '', description: '' });
     } catch (error) {
       console.error('Error creating user:', error);
@@ -61,7 +113,10 @@ const UserInterface: React.FC<UserInterfaceProps> = ({ backendName }) => {
   const handleUpdateUser = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     try {
-      await axios.put(`${apiUrl}/api/${backendName}/users/${updateUser.id}`, { name: updateUser.name, email: updateUser.email, description: updateUser.description });
+      await apiCall(`${apiUrl}/api/${backendName}/users/${updateUser.id}`, {
+        method: 'PUT',
+        body: JSON.stringify({ name: updateUser.name, email: updateUser.email, description: updateUser.description }),
+      });
       setUpdateUser({ id: '', name: '', email: '', description: '' });
       setUsers(
         users.map((user) => {
@@ -79,7 +134,9 @@ const UserInterface: React.FC<UserInterfaceProps> = ({ backendName }) => {
   // Delete a user
   const deleteUser = async (userId: number) => {
     try {
-      await axios.delete(`${apiUrl}/api/${backendName}/users/${userId}`);
+      await apiCall(`${apiUrl}/api/${backendName}/users/${userId}`, {
+        method: 'DELETE',
+      });
       setUsers(users.filter((user) => user.id !== userId));
     } catch (error) {
       console.error('Error deleting user:', error);
@@ -90,16 +147,6 @@ const UserInterface: React.FC<UserInterfaceProps> = ({ backendName }) => {
     <div className={`user-interface ${bgColor} ${backendName} w-full max-w-md p-4 my-4 rounded shadow`}>
       <img src={`Go-Logo_Yellow.png`} alt={`${backendName} Logo`} className="w-50 h-50 mb-6 mx-auto" />
       <h2 className="text-xl font-bold text-center text-white mb-6">{`${backendName.charAt(0).toUpperCase() + backendName.slice(1)} Backend`}</h2>
-      
-      {/* Navigation to Login */}
-      <div className="mb-6 text-center">
-        <a
-          href="/login"
-          className="inline-block px-6 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 transition-colors shadow-md hover:shadow-lg"
-        >
-          Go to Login Page
-        </a>
-      </div>
 
       {/* Form to add new user */}
       <form onSubmit={createUser} className="mb-6 p-4 bg-blue-100 rounded shadow">

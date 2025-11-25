@@ -58,14 +58,19 @@ func main() {
 
 	// create router
 	router := mux.NewRouter()
-	router.HandleFunc("/api/go/users", getUsers(db)).Methods("GET")
-	router.HandleFunc("/api/go/users", createUser(db)).Methods("POST")
-	router.HandleFunc("/api/go/users/{id}", getUser(db)).Methods("GET")
-	router.HandleFunc("/api/go/users/{id}", updateUser(db)).Methods("PUT")
-	router.HandleFunc("/api/go/users/{id}", deleteUser(db)).Methods("DELETE")
 
+	// PUBLIC routes (no authentication required)
 	router.HandleFunc("/api/go/auth/google", redirectToGoogleLogin).Methods("GET")
 	router.HandleFunc("/api/go/auth/google/callback", handleGoogleCallback).Methods("GET")
+	router.HandleFunc("/api/go/auth/refresh", handleRefreshToken).Methods("POST")
+	router.HandleFunc("/api/go/auth/logout", handleLogout).Methods("POST")
+
+	// PROTECTED routes (require Google access token)
+	router.HandleFunc("/api/go/users", googleAuthMiddleware(getUsers(db))).Methods("GET")
+	router.HandleFunc("/api/go/users", googleAuthMiddleware(createUser(db))).Methods("POST")
+	router.HandleFunc("/api/go/users/{id}", googleAuthMiddleware(getUser(db))).Methods("GET")
+	router.HandleFunc("/api/go/users/{id}", googleAuthMiddleware(updateUser(db))).Methods("PUT")
+	router.HandleFunc("/api/go/users/{id}", googleAuthMiddleware(deleteUser(db))).Methods("DELETE")
 
 	// wrap the router with CORS and JSON content type middlewares
 	enhancedRouter := enableCORS(jsonContentTypeMiddleware(router))
@@ -110,15 +115,17 @@ func redirectToGoogleLogin(w http.ResponseWriter, r *http.Request) {
 	// Check for duplicate (very unlikely with 32 random bytes)
 	if _, ok := oauthStateCache[state]; ok {
 		log.Printf("Warning: State collision detected, regenerating...")
-		// In production, you might want to retry here
 	}
 
 	// Store state in cache
 	oauthStateCache[state] = true
 	log.Printf("Generated OAuth state: %s", state)
 
-	// Generate OAuth URL
-	url := conf.AuthCodeURL(state, oauth2.AccessTypeOffline)
+	// Generate OAuth URL with offline access to get refresh token
+	url := conf.AuthCodeURL(state,
+		oauth2.AccessTypeOffline,
+		oauth2.ApprovalForce, // Force prompt to ensure we get refresh token
+	)
 
 	http.Redirect(w, r, url, http.StatusTemporaryRedirect)
 }
@@ -126,8 +133,11 @@ func redirectToGoogleLogin(w http.ResponseWriter, r *http.Request) {
 func handleGoogleCallback(w http.ResponseWriter, r *http.Request) {
 	state := r.URL.Query().Get("state")
 
+	// Validate state
 	if _, ok := oauthStateCache[state]; !ok {
-		log.Fatalf("Invalid state: %s", state)
+		log.Printf("Invalid state: %s", state)
+		frontendURL := getFrontendURL()
+		http.Redirect(w, r, fmt.Sprintf("%s/?error=invalid_state", frontendURL), http.StatusTemporaryRedirect)
 		return
 	}
 	delete(oauthStateCache, state)
@@ -135,58 +145,267 @@ func handleGoogleCallback(w http.ResponseWriter, r *http.Request) {
 
 	code := r.URL.Query().Get("code")
 
+	// Exchange code for token (includes access_token and refresh_token)
 	token, err := conf.Exchange(context.Background(), code)
-
 	if err != nil {
-		log.Fatalf("Error exchanging code for token: %v", err)
+		log.Printf("Error exchanging code for token: %v", err)
+		frontendURL := getFrontendURL()
+		http.Redirect(w, r, fmt.Sprintf("%s/?error=token_exchange_failed", frontendURL), http.StatusTemporaryRedirect)
 		return
 	}
 
+	// Get user info using access token
 	response, err := http.Get("https://www.googleapis.com/oauth2/v2/userinfo?access_token=" + token.AccessToken)
-
 	if err != nil {
-		log.Fatalf("Error getting user info: %v", err)
+		log.Printf("Error getting user info: %v", err)
+		frontendURL := getFrontendURL()
+		http.Redirect(w, r, fmt.Sprintf("%s/?error=userinfo_failed", frontendURL), http.StatusTemporaryRedirect)
 		return
 	}
+	defer response.Body.Close()
 
 	data, err := io.ReadAll(response.Body)
-
 	if err != nil {
-		log.Fatalf("Error reading response body: %v", err)
+		log.Printf("Error reading response body: %v", err)
 		return
 	}
 
 	var oAuthData OAuthData
 	err = json.Unmarshal(data, &oAuthData)
-
 	if err != nil {
-		log.Fatalf("Error unmarshalling user info: %v", err)
+		log.Printf("Error unmarshalling user info: %v", err)
 		return
 	}
 
-	// Log the OAuth result
-	log.Printf("OAuth successful for user: %s (verified: %v)", oAuthData.Email, oAuthData.Verified_email)
+	// Check email verification
+	if !oAuthData.Verified_email {
+		log.Printf("Email not verified for user: %s", oAuthData.Email)
+		frontendURL := getFrontendURL()
+		http.Redirect(w, r, fmt.Sprintf("%s/?error=verification_failed", frontendURL), http.StatusTemporaryRedirect)
+		return
+	}
 
-	// Get frontend URL for redirect
+	// Log success
+	log.Printf("OAuth successful for user: %s", oAuthData.Email)
+
+	// Set Google Access Token cookie (1 hour expiry)
+	http.SetCookie(w, &http.Cookie{
+		Name:     "google_access_token",
+		Value:    token.AccessToken,
+		Path:     "/",
+		MaxAge:   30, // 1 hour
+		HttpOnly: true,
+		Secure:   false, // Set to true in production with HTTPS
+		SameSite: http.SameSiteLaxMode,
+	})
+
+	// Set Google Refresh Token cookie (long-lived)
+	if token.RefreshToken != "" {
+		http.SetCookie(w, &http.Cookie{
+			Name:  "google_refresh_token",
+			Value: token.RefreshToken,
+			Path:  "/",
+			// MaxAge:   2592000
+			MaxAge:   100,
+			HttpOnly: true,
+			Secure:   false,
+			SameSite: http.SameSiteLaxMode,
+		})
+		log.Printf("Refresh token set for user: %s", oAuthData.Email)
+	} else {
+		log.Printf("Warning: No refresh token received for user: %s", oAuthData.Email)
+	}
+
+	// Store user email cookie (readable by frontend)
+	http.SetCookie(w, &http.Cookie{
+		Name:     "user_email",
+		Value:    oAuthData.Email,
+		Path:     "/",
+		MaxAge:   3600,
+		HttpOnly: false, // Frontend needs to read this
+		Secure:   false,
+		SameSite: http.SameSiteLaxMode,
+	})
+
+	// Redirect to frontend
+	frontendURL := getFrontendURL()
+	http.Redirect(w, r, fmt.Sprintf("%s/?login=success&email=%s", frontendURL, oAuthData.Email), http.StatusTemporaryRedirect)
+}
+
+// Helper function to get frontend URL
+func getFrontendURL() string {
 	frontendURL := os.Getenv("FRONTEND_URL")
 	if frontendURL == "" {
 		frontendURL = "http://localhost:3000"
 	}
+	return frontendURL
+}
 
-	// Redirect to frontend based on verification status
-	if oAuthData.Verified_email {
-		// Success - redirect to home page with success message
-		http.Redirect(w, r, fmt.Sprintf("%s/?login=success&email=%s", frontendURL, oAuthData.Email), http.StatusTemporaryRedirect)
-	} else {
-		// Failed - redirect to login page with error
-		http.Redirect(w, r, fmt.Sprintf("%s/login?error=verification_failed", frontendURL), http.StatusTemporaryRedirect)
+// Validate Google access token
+func validateGoogleToken(accessToken string) (*OAuthData, error) {
+	response, err := http.Get("https://www.googleapis.com/oauth2/v2/userinfo?access_token=" + accessToken)
+	if err != nil {
+		return nil, err
 	}
+	defer response.Body.Close()
+
+	if response.StatusCode != 200 {
+		return nil, fmt.Errorf("invalid token, status: %d", response.StatusCode)
+	}
+
+	data, err := io.ReadAll(response.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var userInfo OAuthData
+	err = json.Unmarshal(data, &userInfo)
+	if err != nil {
+		return nil, err
+	}
+
+	return &userInfo, nil
+}
+
+// Middleware to validate Google access token
+func googleAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Get access token from cookie
+		cookie, err := r.Cookie("google_access_token")
+		if err != nil {
+			http.Error(w, `{"error": "Unauthorized - No access token"}`, http.StatusUnauthorized)
+			return
+		}
+
+		// Validate token with Google
+		userInfo, err := validateGoogleToken(cookie.Value)
+		if err != nil {
+			log.Printf("Access token invalid: %v", err)
+			http.Error(w, `{"error": "Unauthorized - Invalid token"}`, http.StatusUnauthorized)
+			return
+		}
+
+		// Add user info to context
+		ctx := context.WithValue(r.Context(), "user_email", userInfo.Email)
+		ctx = context.WithValue(ctx, "user_id", userInfo.Id)
+
+		// Call next handler
+		next.ServeHTTP(w, r.WithContext(ctx))
+	}
+}
+
+// Token refresh endpoint
+func handleRefreshToken(w http.ResponseWriter, r *http.Request) {
+	// Get refresh token from cookie
+	refreshCookie, err := r.Cookie("google_refresh_token")
+	if err != nil {
+		http.Error(w, `{"error": "No refresh token"}`, http.StatusUnauthorized)
+		return
+	}
+
+	// Use Google's OAuth2 library to refresh the token
+	token := &oauth2.Token{
+		RefreshToken: refreshCookie.Value,
+	}
+
+	// Get new token from Google
+	tokenSource := conf.TokenSource(context.Background(), token)
+	newToken, err := tokenSource.Token()
+	if err != nil {
+		log.Printf("Error refreshing token: %v", err)
+		http.Error(w, `{"error": "Failed to refresh token"}`, http.StatusUnauthorized)
+		return
+	}
+
+	// Set new access token cookie
+	http.SetCookie(w, &http.Cookie{
+		Name:     "google_access_token",
+		Value:    newToken.AccessToken,
+		Path:     "/",
+		MaxAge:   100,
+		HttpOnly: true,
+		Secure:   false,
+		SameSite: http.SameSiteLaxMode,
+	})
+
+	// Google may return a new refresh token - update it if provided
+	if newToken.RefreshToken != "" {
+		log.Printf("New refresh token: %s", newToken.RefreshToken)
+		http.SetCookie(w, &http.Cookie{
+			Name:     "google_refresh_token",
+			Value:    newToken.RefreshToken,
+			Path:     "/",
+			MaxAge:   100,
+			HttpOnly: true,
+			Secure:   false,
+			SameSite: http.SameSiteLaxMode,
+		})
+		log.Printf("Refresh token also updated")
+	}
+
+	log.Printf("Token refreshed successfully")
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{
+		"message": "Token refreshed successfully",
+	})
+}
+
+// Logout endpoint
+func handleLogout(w http.ResponseWriter, r *http.Request) {
+	// Get access token to revoke it with Google (optional but recommended)
+	accessCookie, _ := r.Cookie("google_access_token")
+
+	if accessCookie != nil {
+		// Revoke token with Google
+		revokeURL := fmt.Sprintf("https://oauth2.googleapis.com/revoke?token=%s", accessCookie.Value)
+		resp, err := http.Post(revokeURL, "application/x-www-form-urlencoded", nil)
+		if err == nil {
+			resp.Body.Close()
+			log.Printf("Token revoked with Google")
+		}
+	}
+
+	// Clear all auth cookies
+	http.SetCookie(w, &http.Cookie{
+		Name:     "google_access_token",
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		HttpOnly: true,
+	})
+
+	http.SetCookie(w, &http.Cookie{
+		Name:     "google_refresh_token",
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		HttpOnly: true,
+	})
+
+	http.SetCookie(w, &http.Cookie{
+		Name:   "user_email",
+		Value:  "",
+		Path:   "/",
+		MaxAge: -1,
+	})
+
+	log.Printf("User logged out successfully")
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{
+		"message": "Logged out successfully",
+	})
 }
 
 func enableCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Set CORS headers
-		w.Header().Set("Access-Control-Allow-Origin", "*") // Allow any origin
+		// Get frontend URL
+		frontendURL := getFrontendURL()
+
+		// CRITICAL: Must use specific origin, not "*" for cookies
+		w.Header().Set("Access-Control-Allow-Origin", frontendURL)
+		w.Header().Set("Access-Control-Allow-Credentials", "true") // REQUIRED for cookies
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 
