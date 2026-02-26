@@ -14,7 +14,7 @@ services:
       - goapp
   goapp:
     container_name: goapp
-    image: francescoxx/goapp:1.0.0
+    image: goapp:1.0.0
     build:
       context: ./backend_go
       dockerfile: go.dockerfile
