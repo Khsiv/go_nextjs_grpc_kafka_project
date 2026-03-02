@@ -58,12 +58,6 @@ func initDatabase() *sql.DB {
 		log.Fatal(err)
 	}
 
-	// create table if it doesn't exist
-	_, err = db.Exec("CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, name TEXT, email TEXT, description TEXT)")
-	if err != nil {
-		log.Fatal(err)
-	}
-
 	return db
 }
 
