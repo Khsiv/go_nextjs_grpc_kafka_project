@@ -7,21 +7,28 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"time"
+
+	"backend_grpc/pb"
 
 	"github.com/gorilla/mux"
 	_ "github.com/lib/pq"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 var (
 	oauthStateCache = make(map[string]bool)
 	conf            *oauth2.Config
+	addr            = flag.String("addr", "localhost:50051", "the address to connect to")
 )
 
 func initOAuth() {
@@ -45,7 +52,21 @@ func initOAuth() {
 	}
 }
 
-func initDatabase() *sql.DB {
+func InitGrpcClient() (pb.GreeterClient, *grpc.ClientConn) {
+	grpcAddr := os.Getenv("GRPC_ADDR")
+	if grpcAddr == "" {
+		grpcAddr = "localhost:50051"
+	}
+	fmt.Println("grpcAddr:", grpcAddr)
+	conn, err := grpc.NewClient(grpcAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		log.Fatalf("did not connect: %v", err)
+	}
+	c := pb.NewGreeterClient(conn)
+	return c, conn
+}
+
+func InitDatabase() *sql.DB {
 	// connect to database
 	connStr := os.Getenv("DATABASE_URL")
 	if connStr == "" {
@@ -61,14 +82,11 @@ func initDatabase() *sql.DB {
 	return db
 }
 
-func GetRouter() *mux.Router {
+func GetRouter(db *sql.DB, grpcClient pb.GreeterClient) *mux.Router {
 
 	router := mux.NewRouter()
 
 	initOAuth()
-
-	db := initDatabase()
-	defer db.Close()
 
 	// PUBLIC routes (no authentication required)
 	router.HandleFunc("/api/go/auth/google", redirectToGoogleLogin).Methods("GET")
@@ -79,6 +97,7 @@ func GetRouter() *mux.Router {
 	// PROTECTED routes (require Google access token)
 	router.HandleFunc("/api/go/users", googleAuthMiddleware(getUsers(db))).Methods("GET")
 	router.HandleFunc("/api/go/users", googleAuthMiddleware(createUser(db))).Methods("POST")
+	router.HandleFunc("/api/go/users/createPost", googleAuthMiddleware(createPost(grpcClient))).Methods("POST")
 	router.HandleFunc("/api/go/users/{id}", googleAuthMiddleware(getUser(db))).Methods("GET")
 	router.HandleFunc("/api/go/users/{id}", googleAuthMiddleware(updateUser(db))).Methods("PUT")
 	router.HandleFunc("/api/go/users/{id}", googleAuthMiddleware(deleteUser(db))).Methods("DELETE")
@@ -203,11 +222,11 @@ func handleGoogleCallback(w http.ResponseWriter, r *http.Request) {
 	// Set Google Refresh Token cookie (long-lived)
 	if token.RefreshToken != "" {
 		http.SetCookie(w, &http.Cookie{
-			Name:  "google_refresh_token",
-			Value: token.RefreshToken,
-			Path:  "/",
-			// MaxAge:   2592000
-			MaxAge:   100,
+			Name:   "google_refresh_token",
+			Value:  token.RefreshToken,
+			Path:   "/",
+			MaxAge: 2592000,
+			// MaxAge:   100,
 			HttpOnly: true,
 			Secure:   false,
 			SameSite: http.SameSiteLaxMode,
@@ -491,6 +510,28 @@ func createUser(db *sql.DB) http.HandlerFunc {
 		fmt.Println("models.User created: ", u)
 
 		json.NewEncoder(w).Encode(u)
+	}
+}
+
+func createPost(grpcClient pb.GreeterClient) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		var mesagePost pb.MeesagePost
+		json.NewDecoder(r.Body).Decode(&mesagePost)
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+
+		_, err := grpcClient.MakePost(ctx, &mesagePost)
+		if err != nil {
+			log.Printf("gRPC MakePost failed: %v", err)
+			http.Error(w, `{"error": "failed to create post"}`, http.StatusInternalServerError)
+			return
+		}
+
+		fmt.Println("models.User mesagePost: ", &mesagePost)
+
+		json.NewEncoder(w).Encode(&mesagePost)
 	}
 }
 

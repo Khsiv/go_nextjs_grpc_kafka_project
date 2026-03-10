@@ -1,0 +1,21 @@
+syntax = 'proto3';
+
+option go_package="backend_grpc/pb";
+
+package backend_service;
+
+
+
+service Greeter {
+    rpc MakePost (MeesagePost) returns (Status) {}
+    
+  }
+
+  message MeesagePost {
+    string content = 1;
+    int32 userId = 2;
+  }
+
+  message Status {
+    bool status = 1;
+  }

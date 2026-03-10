@@ -313,6 +313,9 @@ Before deploying to production:
 
 ---
 
+### Before run others docker compose commands run it
+- docker compose run --rm protoc 
+
 ## Summary
 
 ✅ **Complete Google OAuth authentication with refresh tokens**

@@ -1,5 +1,24 @@
 
 services:
+  grpc_server:
+    container_name: grpc_server
+    image: grpc_server:1.0.0
+    build:
+      context: ./backend_grpc
+      dockerfile: grpc.dockerfile
+    environment:
+      DATABASE_URL: 'postgres://postgres:postgres@db:5432/postgres?sslmode=disable'
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+  protoc_grpc:
+    build:
+      context: ./backend_grpc
+      dockerfile: protoc.dockerfile
+    volumes:
+      - ./backend_grpc:/app
   nextapp:
     container_name: nextapp
     image: nextapp:1.0.0
@@ -16,10 +35,11 @@ services:
     container_name: goapp
     image: goapp:1.0.0
     build:
-      context: ./backend_go
-      dockerfile: go.dockerfile
+      context: .          # <-- was ./backend_go
+      dockerfile: backend_go/go.dockerfile
     environment:
       DATABASE_URL: 'postgres://postgres:postgres@db:5432/postgres?sslmode=disable'
+      GRPC_ADDR: 'grpc_server:50051'
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
       GOOGLE_REDIRECT_URL: ${GOOGLE_REDIRECT_URL:-http://localhost:8000/api/go/auth/google/callback}
@@ -31,6 +51,8 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
+      grpc_server:
+        condition: service_started
   migrate:
     container_name: migrate
     image: migrate/migrate
@@ -62,6 +84,5 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
-
 volumes:
   pgdata:
