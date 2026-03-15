@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { useRouter } from 'next/router';
 import CardComponent from './CardComponent';
 
 interface User {
@@ -8,15 +9,24 @@ interface User {
   description?: string;
 }
 
+interface NewPost {
+  userId: string;
+  content: string;
+}
+
 interface UserInterfaceProps {
   backendName: string;
 }
 
 const UserInterface: React.FC<UserInterfaceProps> = ({ backendName }) => {
+  const router = useRouter();
   const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
   const [users, setUsers] = useState<User[]>([]);
   const [newUser, setNewUser] = useState({ name: '', email: '', description: '' });
   const [updateUser, setUpdateUser] = useState({ id: '', name: '', email: '', description: '' });
+  const [newPost, setNewPost] = useState<NewPost>({ userId: '', content: '' });
+  const [postStatus, setPostStatus] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+  const [isCreatingPost, setIsCreatingPost] = useState(false);
 
   // Define styles based on the backend name
   const backgroundColors: { [key: string]: string } = {
@@ -109,6 +119,45 @@ const UserInterface: React.FC<UserInterfaceProps> = ({ backendName }) => {
     }
   };
 
+  // Create a post through the protected gRPC-backed endpoint
+  const handleCreatePost = async (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    setPostStatus(null);
+
+    if (!newPost.userId.trim() || !newPost.content.trim()) {
+      setPostStatus({ type: 'error', message: 'User ID and post content are required.' });
+      return;
+    }
+
+    setIsCreatingPost(true);
+
+    try {
+      const response = await apiCall(`${apiUrl}/api/${backendName}/users/createPost`, {
+        method: 'POST',
+        body: JSON.stringify({
+          userId: Number(newPost.userId),
+          content: newPost.content,
+        }),
+      });
+
+      const data = await response.json().catch(() => null);
+
+      if (!response.ok) {
+        const errorMessage = data?.error || 'Failed to create post.';
+        setPostStatus({ type: 'error', message: errorMessage });
+        return;
+      }
+
+      setPostStatus({ type: 'success', message: `Post created for user ${data?.userId ?? newPost.userId}.` });
+      setNewPost({ userId: '', content: '' });
+    } catch (error) {
+      console.error('Error creating post:', error);
+      setPostStatus({ type: 'error', message: 'Request failed while creating post.' });
+    } finally {
+      setIsCreatingPost(false);
+    }
+  };
+
   // Update a user
   const handleUpdateUser = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
@@ -175,6 +224,38 @@ const UserInterface: React.FC<UserInterfaceProps> = ({ backendName }) => {
         </button>
       </form>
 
+      <form onSubmit={handleCreatePost} className="mb-6 p-4 bg-blue-100 rounded shadow">
+        <input
+          placeholder="User Id"
+          value={newPost.userId}
+          onChange={(e) => setNewPost({ ...newPost, userId: e.target.value })}
+          className="mb-2 w-full p-2 border border-gray-300 rounded"
+        />
+        <textarea
+          placeholder="Post content"
+          value={newPost.content}
+          onChange={(e) => setNewPost({ ...newPost, content: e.target.value })}
+          className="mb-2 w-full p-2 border border-gray-300 rounded"
+          rows={3}
+        />
+        {postStatus ? (
+          <div
+            className={`mb-2 rounded p-2 text-sm ${
+              postStatus.type === 'success' ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'
+            }`}
+          >
+            {postStatus.message}
+          </div>
+        ) : null}
+        <button
+          type="submit"
+          disabled={isCreatingPost}
+          className="w-full p-2 text-white bg-purple-600 rounded hover:bg-purple-700 disabled:cursor-not-allowed disabled:bg-purple-300"
+        >
+          {isCreatingPost ? 'Creating Post...' : 'Create Post'}
+        </button>
+      </form>
+
       {/* Form to update user */}
       <form onSubmit={handleUpdateUser} className="mb-6 p-4 bg-blue-100 rounded shadow">
         <input
@@ -210,11 +291,20 @@ const UserInterface: React.FC<UserInterfaceProps> = ({ backendName }) => {
       {/* Display users */}
       <div className="space-y-4">
         {users.map((user) => (
-          <div key={user.id} className="flex items-center justify-between bg-white p-4 rounded-lg shadow">
+          <div key={user.id} className="flex items-start justify-between gap-4 bg-white p-4 rounded-lg shadow">
             <CardComponent card={user} />
-            <button onClick={() => deleteUser(user.id)} className={`${btnColor} text-white py-2 px-4 rounded`}>
-              Delete User
-            </button>
+            <div className="flex flex-col gap-2">
+              <button
+                type="button"
+                onClick={() => router.push(`/users/${user.id}/posts`)}
+                className="bg-indigo-600 text-white py-2 px-4 rounded hover:bg-indigo-700"
+              >
+                View Posts
+              </button>
+              <button type="button" onClick={() => deleteUser(user.id)} className={`${btnColor} text-white py-2 px-4 rounded`}>
+                Delete User
+              </button>
+            </div>
           </div>
         ))}
       </div>

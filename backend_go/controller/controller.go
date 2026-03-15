@@ -98,6 +98,7 @@ func GetRouter(db *sql.DB, grpcClient pb.GreeterClient) *mux.Router {
 	router.HandleFunc("/api/go/users", googleAuthMiddleware(getUsers(db))).Methods("GET")
 	router.HandleFunc("/api/go/users", googleAuthMiddleware(createUser(db))).Methods("POST")
 	router.HandleFunc("/api/go/users/createPost", googleAuthMiddleware(createPost(grpcClient))).Methods("POST")
+	router.HandleFunc("/api/go/users/{id}/posts", googleAuthMiddleware(getUserPosts(db))).Methods("GET")
 	router.HandleFunc("/api/go/users/{id}", googleAuthMiddleware(getUser(db))).Methods("GET")
 	router.HandleFunc("/api/go/users/{id}", googleAuthMiddleware(updateUser(db))).Methods("PUT")
 	router.HandleFunc("/api/go/users/{id}", googleAuthMiddleware(deleteUser(db))).Methods("DELETE")
@@ -213,7 +214,7 @@ func handleGoogleCallback(w http.ResponseWriter, r *http.Request) {
 		Name:     "google_access_token",
 		Value:    token.AccessToken,
 		Path:     "/",
-		MaxAge:   30, // 1 hour
+		MaxAge:   3600, // 1 hour
 		HttpOnly: true,
 		Secure:   false, // Set to true in production with HTTPS
 		SameSite: http.SameSiteLaxMode,
@@ -333,7 +334,7 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request) {
 		Name:     "google_access_token",
 		Value:    newToken.AccessToken,
 		Path:     "/",
-		MaxAge:   100,
+		MaxAge:   3600,
 		HttpOnly: true,
 		Secure:   false,
 		SameSite: http.SameSiteLaxMode,
@@ -346,7 +347,7 @@ func handleRefreshToken(w http.ResponseWriter, r *http.Request) {
 			Name:     "google_refresh_token",
 			Value:    newToken.RefreshToken,
 			Path:     "/",
-			MaxAge:   100,
+			MaxAge:   2592000,
 			HttpOnly: true,
 			Secure:   false,
 			SameSite: http.SameSiteLaxMode,
@@ -532,6 +533,57 @@ func createPost(grpcClient pb.GreeterClient) http.HandlerFunc {
 		fmt.Println("models.User mesagePost: ", &mesagePost)
 
 		json.NewEncoder(w).Encode(&mesagePost)
+	}
+}
+
+func getUserPosts(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		vars := mux.Vars(r)
+		id := vars["id"]
+
+		var existingUserID int
+		err := db.QueryRow("SELECT id FROM users WHERE id = $1", id).Scan(&existingUserID)
+		if err == sql.ErrNoRows {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]string{"error": "user not found"})
+			return
+		}
+		if err != nil {
+			log.Printf("Error checking user before loading posts: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": "failed to load posts"})
+			return
+		}
+
+		rows, err := db.Query("SELECT id, users_id, post_text FROM posts WHERE users_id = $1 ORDER BY id DESC", id)
+		if err != nil {
+			log.Printf("Error loading posts for user %s: %v", id, err)
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": "failed to load posts"})
+			return
+		}
+		defer rows.Close()
+
+		posts := []models.Post{}
+		for rows.Next() {
+			var post models.Post
+			if err := rows.Scan(&post.Id, &post.UserId, &post.Content); err != nil {
+				log.Printf("Error scanning post row for user %s: %v", id, err)
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]string{"error": "failed to load posts"})
+				return
+			}
+			posts = append(posts, post)
+		}
+
+		if err := rows.Err(); err != nil {
+			log.Printf("Error iterating posts for user %s: %v", id, err)
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": "failed to load posts"})
+			return
+		}
+
+		json.NewEncoder(w).Encode(posts)
 	}
 }
 
