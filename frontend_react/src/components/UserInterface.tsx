@@ -1,6 +1,7 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { useRouter } from 'next/router';
 import CardComponent from './CardComponent';
+import { useUserStats } from '../hooks/useUserStats';
 
 interface User {
   id: number;
@@ -41,7 +42,7 @@ const UserInterface: React.FC<UserInterfaceProps> = ({ backendName }) => {
   const btnColor = buttonColors[backendName as keyof typeof buttonColors] || 'bg-gray-500 hover:bg-gray-600';
 
   // Refresh access token
-  const refreshAccessToken = async (): Promise<boolean> => {
+  const refreshAccessToken = useCallback(async (): Promise<boolean> => {
     try {
       const response = await fetch(`${apiUrl}/api/go/auth/refresh`, {
         method: 'POST',
@@ -52,41 +53,48 @@ const UserInterface: React.FC<UserInterfaceProps> = ({ backendName }) => {
       console.error('Token refresh failed:', error);
       return false;
     }
-  };
+  }, [apiUrl]);
 
-  // API call wrapper with auto-refresh
-  const apiCall = async (url: string, options: RequestInit = {}): Promise<Response> => {
-    const response = await fetch(url, {
-      ...options,
-      credentials: 'include', // CRITICAL: Send cookies with request
-      headers: {
-        'Content-Type': 'application/json',
-        ...options.headers,
-      },
-    });
+  // API call wrapper with auto-refresh.
+  // Memoised so hooks that depend on it (useUserStats) keep stable callbacks.
+  const apiCall = useCallback(
+    async (url: string, options: RequestInit = {}): Promise<Response> => {
+      const response = await fetch(url, {
+        ...options,
+        credentials: 'include', // CRITICAL: Send cookies with request
+        headers: {
+          'Content-Type': 'application/json',
+          ...options.headers,
+        },
+      });
 
-    // If unauthorized (token expired), try to refresh
-    if (response.status === 401) {
-      const refreshed = await refreshAccessToken();
-      if (refreshed) {
-        // Retry the original request
-        return fetch(url, {
-          ...options,
-          credentials: 'include',
-          headers: {
-            'Content-Type': 'application/json',
-            ...options.headers,
-          },
-        });
-      } else {
-        // Refresh failed, redirect to login
-        window.location.href = '/';
-        throw new Error('Session expired');
+      // If unauthorized (token expired), try to refresh
+      if (response.status === 401) {
+        const refreshed = await refreshAccessToken();
+        if (refreshed) {
+          // Retry the original request
+          return fetch(url, {
+            ...options,
+            credentials: 'include',
+            headers: {
+              'Content-Type': 'application/json',
+              ...options.headers,
+            },
+          });
+        } else {
+          // Refresh failed, redirect to login
+          window.location.href = '/';
+          throw new Error('Session expired');
+        }
       }
-    }
 
-    return response;
-  };
+      return response;
+    },
+    [refreshAccessToken]
+  );
+
+  // Character-count stats, calculated asynchronously via Kafka and pushed back over SSE
+  const { stats, inFlight, loadAllStats, calculateStats } = useUserStats(apiUrl, backendName, apiCall);
 
   // Fetch users
   useEffect(() => {
@@ -101,7 +109,12 @@ const UserInterface: React.FC<UserInterfaceProps> = ({ backendName }) => {
     };
 
     fetchData();
-  }, [backendName, apiUrl]);
+  }, [backendName, apiUrl, apiCall]);
+
+  // Show any previously calculated counts straight away on page load
+  useEffect(() => {
+    loadAllStats();
+  }, [loadAllStats]);
 
   // Create a user
   const createUser = async (e: React.FormEvent<HTMLFormElement>) => {
@@ -292,8 +305,16 @@ const UserInterface: React.FC<UserInterfaceProps> = ({ backendName }) => {
       <div className="space-y-4">
         {users.map((user) => (
           <div key={user.id} className="flex items-start justify-between gap-4 bg-white p-4 rounded-lg shadow">
-            <CardComponent card={user} />
+            <CardComponent card={user} stats={stats[user.id]} />
             <div className="flex flex-col gap-2">
+              <button
+                type="button"
+                onClick={() => calculateStats(user.id)}
+                disabled={Boolean(inFlight[user.id])}
+                className="bg-amber-600 text-white py-2 px-4 rounded hover:bg-amber-700 disabled:cursor-not-allowed disabled:bg-amber-300"
+              >
+                {inFlight[user.id] ? 'Counting...' : 'Count Characters'}
+              </button>
               <button
                 type="button"
                 onClick={() => router.push(`/users/${user.id}/posts`)}

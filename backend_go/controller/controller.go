@@ -88,6 +88,20 @@ func GetRouter(db *sql.DB, grpcClient pb.GreeterClient) *mux.Router {
 
 	initOAuth()
 
+	registerRoutes(router, db, grpcClient)
+
+	// wrap the router with CORS and JSON content type middlewares
+	enhancedRouter := enableCORS(jsonContentTypeMiddleware(router))
+	// start server
+	log.Fatal(http.ListenAndServe(":8000", enhancedRouter))
+
+	return router
+}
+
+// registerRoutes is separate from GetRouter so the route table can be built without
+// a database, a gRPC client, or a listening socket (see controller_test.go).
+// Order matters: mux returns the first matching route.
+func registerRoutes(router *mux.Router, db *sql.DB, grpcClient pb.GreeterClient) {
 	// PUBLIC routes (no authentication required)
 	router.HandleFunc("/api/go/auth/google", redirectToGoogleLogin).Methods("GET")
 	router.HandleFunc("/api/go/auth/google/callback", handleGoogleCallback).Methods("GET")
@@ -98,17 +112,15 @@ func GetRouter(db *sql.DB, grpcClient pb.GreeterClient) *mux.Router {
 	router.HandleFunc("/api/go/users", googleAuthMiddleware(getUsers(db))).Methods("GET")
 	router.HandleFunc("/api/go/users", googleAuthMiddleware(createUser(db))).Methods("POST")
 	router.HandleFunc("/api/go/users/createPost", googleAuthMiddleware(createPost(grpcClient))).Methods("POST")
+	// Registered before "/api/go/users/{id}" so that "stats" is not matched as an id.
+	router.HandleFunc("/api/go/users/stats", googleAuthMiddleware(getAllUserStats(db))).Methods("GET")
+	router.HandleFunc("/api/go/users/{id}/stats/recalculate", googleAuthMiddleware(requestStats(db))).Methods("POST")
+	router.HandleFunc("/api/go/users/{id}/stats/stream", googleAuthMiddleware(streamUserStats(db))).Methods("GET")
+	router.HandleFunc("/api/go/users/{id}/stats", googleAuthMiddleware(getUserStats(db))).Methods("GET")
 	router.HandleFunc("/api/go/users/{id}/posts", googleAuthMiddleware(getUserPosts(db))).Methods("GET")
 	router.HandleFunc("/api/go/users/{id}", googleAuthMiddleware(getUser(db))).Methods("GET")
 	router.HandleFunc("/api/go/users/{id}", googleAuthMiddleware(updateUser(db))).Methods("PUT")
 	router.HandleFunc("/api/go/users/{id}", googleAuthMiddleware(deleteUser(db))).Methods("DELETE")
-
-	// wrap the router with CORS and JSON content type middlewares
-	enhancedRouter := enableCORS(jsonContentTypeMiddleware(router))
-	// start server
-	log.Fatal(http.ListenAndServe(":8000", enhancedRouter))
-
-	return router
 }
 
 // Helper function to get frontend URL
@@ -555,7 +567,9 @@ func getUserPosts(db *sql.DB) http.HandlerFunc {
 			return
 		}
 
-		rows, err := db.Query("SELECT id, users_id, post_text FROM posts WHERE users_id = $1 ORDER BY id DESC", id)
+		// post_text is nullable, so COALESCE it: scanning a NULL into post.Content
+		// (a plain string) fails the whole request with a conversion error.
+		rows, err := db.Query("SELECT id, users_id, COALESCE(post_text, '') FROM posts WHERE users_id = $1 ORDER BY id DESC", id)
 		if err != nil {
 			log.Printf("Error loading posts for user %s: %v", id, err)
 			w.WriteHeader(http.StatusInternalServerError)

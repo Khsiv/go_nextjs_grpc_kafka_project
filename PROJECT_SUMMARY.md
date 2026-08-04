@@ -1,6 +1,6 @@
 # Project Summary
 
-A full-stack web application demonstrating Google OAuth authentication, a REST API in Go, a gRPC microservice, and a Next.js frontend — all orchestrated with Docker Compose backed by PostgreSQL.
+A full-stack web application demonstrating Google OAuth authentication, a REST API in Go, a gRPC microservice, an event-driven Kafka microservice, and a Next.js frontend — all orchestrated with Docker Compose backed by PostgreSQL.
 
 ## Architecture
 
@@ -8,8 +8,22 @@ A full-stack web application demonstrating Google OAuth authentication, a REST A
 ┌──────────────┐   HTTP/JSON    ┌──────────────┐    gRPC     ┌──────────────┐
 │  Next.js UI  │ ─────────────► │  Go REST API │ ──────────► │ gRPC server  │
 │  (port 3000) │  cookies/CORS  │  (port 8000) │  MakePost   │ (port 50051) │
-└──────────────┘                └──────┬───────┘             └──────┬───────┘
-                                       │                            │
+└──────▲───────┘                └──────┬───────┘             └──────┬───────┘
+       │                               │                            │
+       │  SSE           post-stats-requests                         │
+       │  (live)                       │                            │
+       │                               ▼                            │
+       │                     ┌───────────────────┐                  │
+       │                     │  Kafka (KRaft)    │                  │
+       │                     │  :9092 / :29092   │                  │
+       │                     └─────────┬─────────┘                  │
+       │                               │                            │
+       │                    post-stats-requests                     │
+       │                               ▼                            │
+       │                     ┌───────────────────┐                  │
+       └─────────────────────│   stats_service   │                  │
+          post-stats-results └─────────┬─────────┘                  │
+          (API consumes, pushes)       │                            │
                                        ▼                            ▼
                                 ┌────────────────────────────────────────┐
                                 │        PostgreSQL 13 (port 5433)       │
@@ -26,7 +40,18 @@ A full-stack web application demonstrating Google OAuth authentication, a REST A
 - Endpoints:
   - Public: `GET /api/go/auth/google`, `GET /api/go/auth/google/callback`, `POST /api/go/auth/refresh`, `POST /api/go/auth/logout` (revokes the token with Google).
   - Protected: user CRUD under `/api/go/users`, `POST /api/go/users/createPost` (delegates to the gRPC service), `GET /api/go/users/{id}/posts`.
+  - Protected (character counts): `GET /api/go/users/stats`, `POST /api/go/users/{id}/stats/recalculate`, `GET /api/go/users/{id}/stats`, `GET /api/go/users/{id}/stats/stream` (SSE).
+- Route registration order matters — `/api/go/users/stats` must stay ahead of `/api/go/users/{id}`; [controller_test.go](backend_go/controller/controller_test.go) locks this in.
 - CORS is configured for a specific frontend origin with `Allow-Credentials: true` so cookies work cross-origin.
+
+### `stats_service/` — Kafka microservice (Go)
+- Consumes `post-stats-requests`, sums `LENGTH(post_text)` across the user's posts, upserts `user_post_stats`, then produces to `post-stats-results`.
+- [calculator.go](stats_service/calculator.go) holds the SQL; [main.go](stats_service/main.go) holds the consume/produce loop, topic creation with retry, and graceful shutdown.
+- Offsets are committed only after the row is written, so a crash replays the request rather than dropping it.
+- Uses `segmentio/kafka-go` (pure Go, no cgo — builds on the same alpine image as the other services).
+
+### `events/` — shared Kafka contract (Go module)
+- One definition of the topic names and the `StatsRequest` / `StatsResult` message shapes, imported by both `backend_go` and `stats_service` via a `replace` directive.
 
 ### `backend_grpc/` — gRPC microservice (Go)
 - Single `Greeter` service with one RPC, `MakePost(MeesagePost) → Status`, defined in [backend_service.proto](backend_grpc/proto/backend_service.proto); generated code in `pb/`.
@@ -43,17 +68,49 @@ A full-stack web application demonstrating Google OAuth authentication, a REST A
 ### `migrations/` — golang-migrate SQL migrations
 - `users` table: `id`, `name`, `email`, `description`.
 - `posts` table: `id`, `users_id` (FK → users), `post_text`.
+- `user_post_stats` table: `users_id` (PK, FK → users `ON DELETE CASCADE`), `total_characters`, `posts_count`, `status`, `request_id`, `error_message`, `requested_at`, `calculated_at`.
 
 ## Docker Compose services ([compose.yaml](compose.yaml))
 
 | Service | Image / Build | Ports | Notes |
 |---|---|---|---|
 | `db` | postgres:13 | 5433→5432 | Healthcheck; `pgdata` volume |
+| `kafka` | apache/kafka:3.9.0 | 29092 | Single-node KRaft (no Zookeeper); healthcheck; `kafkadata` volume |
 | `migrate` | migrate/migrate | — | Runs migrations after db is healthy |
 | `grpc_server` | backend_grpc | — | Waits on db + migrate |
-| `goapp` | backend_go | 8000 | Waits on db, migrate, grpc_server |
+| `stats_service` | stats_service | — | Waits on db, migrate, kafka |
+| `goapp` | backend_go | 8000 | Waits on db, migrate, grpc_server, kafka |
 | `nextapp` | frontend_react | 3000 | Depends on goapp |
 | `protoc_grpc` | protoc image | — | One-shot proto codegen |
+
+Kafka listeners: containers connect via `kafka:9092`; `localhost:29092` is published so the
+Go services can also be run outside Docker against the same broker. Do not write `0.0.0.0`
+into `KAFKA_LISTENERS` — Kafka derives the controller's advertised address from it and
+rejects that meta-address at startup.
+
+## Character-count feature (Kafka + SSE)
+
+Pressing **Count Characters** on a user card totals the characters across all of that
+user's posts without blocking the request:
+
+1. The browser opens the SSE stream **first**, and only publishes once it is open — so the
+   result can never arrive before anything is listening for it.
+2. `POST /api/go/users/{id}/stats/recalculate` marks the row `pending` and publishes a
+   `StatsRequest` to `post-stats-requests`, keyed by user id. It returns `202` immediately.
+3. `stats_service` consumes it, counts, upserts `user_post_stats`, and publishes a
+   `StatsResult` to `post-stats-results`.
+4. `goapp` consumes that topic and fans the result out to any SSE connection watching that
+   user; the label next to the name updates live.
+
+Notes:
+- The API's result consumer uses a **unique consumer group per process**, because every
+  replica must see every result — it cannot know which one holds the browser's connection.
+- The stream sends the stored row on connect as a separate `snapshot` event, distinct from
+  the live `stats` event, so the client can render the last known value without mistaking
+  it for the answer it is waiting on.
+- `LENGTH()` counts characters, not bytes — an emoji counts as 1, not 4.
+- Set `STATS_CALC_DELAY_MS=2000` on `stats_service` to make the "Calculating..." state
+  visible while demoing.
 
 ## Authentication design
 
@@ -106,12 +163,19 @@ docker compose up --build
 ### Locally without Docker
 
 ```bash
-cd backend_grpc && go run server_grpc.go   # gRPC service on :50051
-cd backend_go   && go run main.go          # REST API on :8000
+cd backend_grpc  && go run server_grpc.go  # gRPC service on :50051
+cd stats_service && go run .               # Kafka consumer
+cd backend_go    && go run main.go         # REST API on :8000
 cd frontend_react && npm install && npm run dev   # UI on :3000
 ```
 
-Both Go services fall back to `postgres://postgres:postgres@localhost:5433/postgres` when `DATABASE_URL` is unset, so the compose `db` service can be reused for local runs.
+All three Go services fall back to `postgres://postgres:postgres@localhost:5433/postgres` when `DATABASE_URL` is unset, and to `localhost:29092` when `KAFKA_BROKERS` is unset, so the compose `db` and `kafka` services can be reused for local runs.
+
+### Tests
+
+```bash
+cd backend_go && go test ./...
+```
 
 ## Troubleshooting
 
@@ -136,3 +200,7 @@ Both Go services fall back to `postgres://postgres:postgres@localhost:5433/postg
 - Every protected request round-trips to Google's userinfo endpoint for token validation (no local caching).
 - Several handlers use `log.Fatal` on DB errors, which kills the process instead of returning a 500.
 - The proto message name `MeesagePost` (typo) is baked into the generated code and JSON contract.
+- `initOAuth` prints `GOOGLE_CLIENT_SECRET` to stdout, so the secret ends up in container logs.
+- `GetRouter` calls `http.ListenAndServe` itself and never returns, so the call in `main.go` and every `defer` there is dead code.
+- Kafka runs as a single broker with replication factor 1 — fine for dev, no redundancy.
+- The API's per-process consumer group leaves an empty group behind on each restart; Kafka expires them, but they are visible in `kafka-consumer-groups.sh --list` in the meantime.

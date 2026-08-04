@@ -1,5 +1,61 @@
 
 services:
+  kafka:
+    container_name: kafka
+    image: apache/kafka:3.9.0
+    ports:
+      # Internal traffic uses kafka:9092 on the compose network; 29092 is published
+      # so the services can also be run outside Docker against this same broker.
+      - "29092:29092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: 'broker,controller'
+      # Empty host binds every interface. Do not write 0.0.0.0 here: Kafka derives the
+      # controller's advertised address from this list and rejects that meta-address.
+      KAFKA_LISTENERS: 'PLAINTEXT://:9092,CONTROLLER://:9093,PLAINTEXT_HOST://:29092'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT'
+      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka:9093'
+      KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
+      # Single-broker KRaft dev cluster, so nothing can be replicated further than 1.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      # Must match the mounted volume; the image otherwise logs to /tmp and loses data.
+      KAFKA_LOG_DIRS: '/var/lib/kafka/data'
+      CLUSTER_ID: 'golang-nextjs-kafka-cluster'
+    volumes:
+      - kafkadata:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+  stats_service:
+    container_name: stats_service
+    image: stats_service:1.0.0
+    build:
+      context: .
+      dockerfile: stats_service/stats.dockerfile
+    environment:
+      DATABASE_URL: 'postgres://postgres:postgres@db:5432/postgres?sslmode=disable'
+      KAFKA_BROKERS: 'kafka:9092'
+      STATS_CONSUMER_GROUP: 'stats-service'
+      # Set to e.g. 2000 to make the "Calculating..." state visible while demoing.
+      STATS_CALC_DELAY_MS: ${STATS_CALC_DELAY_MS:-0}
+    restart: on-failure
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      kafka:
+        condition: service_healthy
   grpc_server:
     container_name: grpc_server
     image: grpc_server:1.0.0
@@ -40,6 +96,7 @@ services:
     environment:
       DATABASE_URL: 'postgres://postgres:postgres@db:5432/postgres?sslmode=disable'
       GRPC_ADDR: 'grpc_server:50051'
+      KAFKA_BROKERS: 'kafka:9092'
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
       GOOGLE_REDIRECT_URL: ${GOOGLE_REDIRECT_URL:-http://localhost:8000/api/go/auth/google/callback}
@@ -53,6 +110,8 @@ services:
         condition: service_completed_successfully
       grpc_server:
         condition: service_started
+      kafka:
+        condition: service_healthy
   migrate:
     container_name: migrate
     image: migrate/migrate
@@ -86,3 +145,4 @@ services:
       retries: 5
 volumes:
   pgdata:
+  kafkadata:

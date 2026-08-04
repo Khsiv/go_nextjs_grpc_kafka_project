@@ -8,6 +8,7 @@ WORKDIR /app
 # COPY . .
 COPY backend_go/ ./backend_go/
 COPY backend_grpc/ ./backend_grpc/
+COPY events/ ./events/
 
 WORKDIR /app/backend_go
 
