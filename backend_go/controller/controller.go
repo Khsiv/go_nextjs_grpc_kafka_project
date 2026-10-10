@@ -263,6 +263,8 @@ func handleGoogleCallback(w http.ResponseWriter, r *http.Request) {
 		SameSite: http.SameSiteLaxMode,
 	})
 
+	//fmt.Print("handleGoogleCallback")
+
 	// Redirect to frontend
 	frontendURL := getFrontendURL()
 	http.Redirect(w, r, fmt.Sprintf("%s/?login=success&email=%s", frontendURL, oAuthData.Email), http.StatusTemporaryRedirect)
