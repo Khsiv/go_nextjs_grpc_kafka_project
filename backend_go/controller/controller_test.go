@@ -33,6 +33,8 @@ func TestRouteResolution(t *testing.T) {
 		{"existing user route still resolves", "GET", "/api/go/users/2", "/api/go/users/{id}"},
 		{"existing posts route still resolves", "GET", "/api/go/users/2/posts", "/api/go/users/{id}/posts"},
 		{"existing createPost route still resolves", "POST", "/api/go/users/createPost", "/api/go/users/createPost"},
+		{"email signup", "POST", "/api/go/auth/signup", "/api/go/auth/signup"},
+		{"email login", "POST", "/api/go/auth/login", "/api/go/auth/login"},
 	}
 
 	for _, tc := range cases {

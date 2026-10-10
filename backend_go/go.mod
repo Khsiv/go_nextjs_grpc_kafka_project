@@ -7,6 +7,7 @@ require (
 	github.com/gorilla/mux v1.8.1
 	github.com/lib/pq v1.11.2
 	github.com/segmentio/kafka-go v0.4.51
+	golang.org/x/crypto v0.46.0
 	golang.org/x/oauth2 v0.34.0
 	google.golang.org/grpc v1.79.2
 )
