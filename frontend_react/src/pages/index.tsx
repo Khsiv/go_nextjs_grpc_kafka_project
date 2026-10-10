@@ -2,41 +2,43 @@ import React, { useEffect, useState } from 'react';
 import { useRouter } from 'next/router';
 import { LoginCard } from '../components/LoginCard';
 import { GoogleLoginButton } from '../components/GoogleLoginButton';
+import { EmailPasswordForm } from '../components/EmailPasswordForm';
 import { ErrorAlert } from '../components/ErrorAlert';
 
 const Home: React.FC = () => {
   const router = useRouter();
   const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
   const [error, setError] = useState<string>('');
+  const [mode, setMode] = useState<'signin' | 'signup'>('signin');
+  const [checkingSession, setCheckingSession] = useState(true);
 
-  // Get email from cookie
   const getUserEmail = (): string | null => {
-    const email = document.cookie
+    const raw = document.cookie
       .split('; ')
       .find(row => row.startsWith('user_email='))
       ?.split('=')[1];
-    return email || null;
-  };
-
-  // Check if access token cookie exists
-  const hasAccessToken = (): boolean => {
-    return document.cookie.includes('google_access_token=');
+    if (!raw) return null;
+    try {
+      return decodeURIComponent(raw);
+    } catch {
+      return raw;
+    }
   };
 
   useEffect(() => {
-    // Check for login success in URL query params
+    if (!router.isReady) return;
+
     const loginParam = router.query.login as string;
     const emailParam = router.query.email as string;
     const errorParam = router.query.error as string;
-    
+
     if (loginParam === 'success' && emailParam) {
-      // Set flag to show success message on dashboard
       localStorage.setItem('showSuccessMessage', 'true');
-      
-      // Redirect to dashboard
       router.replace('/dashboard');
-    } else if (errorParam) {
-      // Handle various error types
+      return;
+    }
+
+    if (errorParam) {
       switch (errorParam) {
         case 'verification_failed':
           setError('Email verification failed. Please try again.');
@@ -50,30 +52,87 @@ const Home: React.FC = () => {
         default:
           setError('Authentication failed. Please try again.');
       }
-    } else {
-      // Check if user is already authenticated (has cookies)
-      const email = getUserEmail();
-      const hasToken = hasAccessToken();
-      
-      if (email && hasToken) {
-        // Already logged in, redirect to dashboard
-        router.replace('/dashboard');
-      }
+      setCheckingSession(false);
+      return;
     }
-  }, [router.query, router]);
+
+    const verifySession = async () => {
+      const email = getUserEmail();
+      if (!email) {
+        setCheckingSession(false);
+        return;
+      }
+
+      try {
+        const response = await fetch(`${apiUrl}/api/go/users`, {
+          credentials: 'include',
+        });
+        if (response.ok) {
+          router.replace('/dashboard');
+          return;
+        }
+        if (response.status === 401) {
+          const refreshResponse = await fetch(`${apiUrl}/api/go/auth/refresh`, {
+            method: 'POST',
+            credentials: 'include',
+          });
+          if (refreshResponse.ok) {
+            router.replace('/dashboard');
+            return;
+          }
+        }
+      } catch (authError) {
+        console.error('Auth check failed:', authError);
+      }
+
+      setCheckingSession(false);
+    };
+
+    verifySession();
+  }, [router.isReady, router.query.login, router.query.email, router.query.error, apiUrl, router]);
 
   const handleGoogleLogin = () => {
-    // Redirect to the backend Google OAuth endpoint
     window.location.href = `${apiUrl}/api/go/auth/google`;
   };
 
+  const handleSignedIn = () => {
+    localStorage.setItem('showSuccessMessage', 'true');
+    router.replace('/dashboard');
+  };
+
+  if (checkingSession && !error) {
+    return null;
+  }
+
   return (
-    <LoginCard>
+    <LoginCard
+      title={mode === 'signup' ? 'Create an account' : 'Welcome Back'}
+      subtitle={
+        mode === 'signup'
+          ? 'Sign up with your email and a password'
+          : 'Sign in to continue to your account'
+      }
+    >
       <ErrorAlert message={error} />
-      
-      <div className="space-y-4">
-        <GoogleLoginButton onClick={handleGoogleLogin} />
+
+      <EmailPasswordForm
+        apiUrl={apiUrl}
+        mode={mode}
+        onModeChange={setMode}
+        onSuccess={handleSignedIn}
+        onError={setError}
+      />
+
+      <div className="relative">
+        <div className="absolute inset-0 flex items-center">
+          <div className="w-full border-t border-gray-200" />
+        </div>
+        <div className="relative flex justify-center text-sm">
+          <span className="px-2 bg-white text-gray-500">or</span>
+        </div>
       </div>
+
+      <GoogleLoginButton onClick={handleGoogleLogin} />
     </LoginCard>
   );
 };

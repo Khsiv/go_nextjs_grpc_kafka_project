@@ -18,11 +18,16 @@ const UserPostsPage: React.FC = () => {
   const userId = typeof router.query.id === 'string' ? router.query.id : '';
 
   const getUserEmail = (): string | null => {
-    const email = document.cookie
+    const raw = document.cookie
       .split('; ')
       .find((row) => row.startsWith('user_email='))
       ?.split('=')[1];
-    return email || null;
+    if (!raw) return null;
+    try {
+      return decodeURIComponent(raw);
+    } catch {
+      return raw;
+    }
   };
 
   const refreshAccessToken = async (): Promise<boolean> => {

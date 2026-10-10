@@ -13,6 +13,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 
 	"backend_grpc/pb"
@@ -103,24 +104,26 @@ func GetRouter(db *sql.DB, grpcClient pb.GreeterClient) *mux.Router {
 // Order matters: mux returns the first matching route.
 func registerRoutes(router *mux.Router, db *sql.DB, grpcClient pb.GreeterClient) {
 	// PUBLIC routes (no authentication required)
+	router.HandleFunc("/api/go/auth/signup", handleSignup(db)).Methods("POST")
+	router.HandleFunc("/api/go/auth/login", handleLogin(db)).Methods("POST")
 	router.HandleFunc("/api/go/auth/google", redirectToGoogleLogin).Methods("GET")
 	router.HandleFunc("/api/go/auth/google/callback", handleGoogleCallback).Methods("GET")
-	router.HandleFunc("/api/go/auth/refresh", handleRefreshToken).Methods("POST")
-	router.HandleFunc("/api/go/auth/logout", handleLogout).Methods("POST")
+	router.HandleFunc("/api/go/auth/refresh", handleRefreshToken(db)).Methods("POST")
+	router.HandleFunc("/api/go/auth/logout", handleLogout(db)).Methods("POST")
 
-	// PROTECTED routes (require Google access token)
-	router.HandleFunc("/api/go/users", googleAuthMiddleware(getUsers(db))).Methods("GET")
-	router.HandleFunc("/api/go/users", googleAuthMiddleware(createUser(db))).Methods("POST")
-	router.HandleFunc("/api/go/users/createPost", googleAuthMiddleware(createPost(grpcClient))).Methods("POST")
+	// PROTECTED routes (require an email/password session or a Google access token)
+	router.HandleFunc("/api/go/users", authMiddleware(db, getUsers(db))).Methods("GET")
+	router.HandleFunc("/api/go/users", authMiddleware(db, createUser(db))).Methods("POST")
+	router.HandleFunc("/api/go/users/createPost", authMiddleware(db, createPost(grpcClient))).Methods("POST")
 	// Registered before "/api/go/users/{id}" so that "stats" is not matched as an id.
-	router.HandleFunc("/api/go/users/stats", googleAuthMiddleware(getAllUserStats(db))).Methods("GET")
-	router.HandleFunc("/api/go/users/{id}/stats/recalculate", googleAuthMiddleware(requestStats(db))).Methods("POST")
-	router.HandleFunc("/api/go/users/{id}/stats/stream", googleAuthMiddleware(streamUserStats(db))).Methods("GET")
-	router.HandleFunc("/api/go/users/{id}/stats", googleAuthMiddleware(getUserStats(db))).Methods("GET")
-	router.HandleFunc("/api/go/users/{id}/posts", googleAuthMiddleware(getUserPosts(db))).Methods("GET")
-	router.HandleFunc("/api/go/users/{id}", googleAuthMiddleware(getUser(db))).Methods("GET")
-	router.HandleFunc("/api/go/users/{id}", googleAuthMiddleware(updateUser(db))).Methods("PUT")
-	router.HandleFunc("/api/go/users/{id}", googleAuthMiddleware(deleteUser(db))).Methods("DELETE")
+	router.HandleFunc("/api/go/users/stats", authMiddleware(db, getAllUserStats(db))).Methods("GET")
+	router.HandleFunc("/api/go/users/{id}/stats/recalculate", authMiddleware(db, requestStats(db))).Methods("POST")
+	router.HandleFunc("/api/go/users/{id}/stats/stream", authMiddleware(db, streamUserStats(db))).Methods("GET")
+	router.HandleFunc("/api/go/users/{id}/stats", authMiddleware(db, getUserStats(db))).Methods("GET")
+	router.HandleFunc("/api/go/users/{id}/posts", authMiddleware(db, getUserPosts(db))).Methods("GET")
+	router.HandleFunc("/api/go/users/{id}", authMiddleware(db, getUser(db))).Methods("GET")
+	router.HandleFunc("/api/go/users/{id}", authMiddleware(db, updateUser(db))).Methods("PUT")
+	router.HandleFunc("/api/go/users/{id}", authMiddleware(db, deleteUser(db))).Methods("DELETE")
 }
 
 // Helper function to get frontend URL
@@ -296,13 +299,29 @@ func validateGoogleToken(accessToken string) (*models.OAuthData, error) {
 	return &userInfo, nil
 }
 
-// Middleware to validate Google access token
-func googleAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
+// Middleware accepts either an email/password session or a Google access token.
+// The session is checked first so a stale Google cookie cannot block a valid login.
+func authMiddleware(db *sql.DB, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if db != nil {
+			if cookie, err := r.Cookie(sessionCookieName); err == nil && cookie.Value != "" {
+				accountID, email, err := accountFromSession(db, cookie.Value)
+				if err == nil {
+					ctx := context.WithValue(r.Context(), "user_email", email)
+					ctx = context.WithValue(ctx, "user_id", strconv.Itoa(accountID))
+					next.ServeHTTP(w, r.WithContext(ctx))
+					return
+				}
+				if err != sql.ErrNoRows {
+					log.Printf("session lookup: %v", err)
+				}
+			}
+		}
+
 		// Get access token from cookie
 		cookie, err := r.Cookie("google_access_token")
 		if err != nil {
-			http.Error(w, `{"error": "Unauthorized - No access token"}`, http.StatusUnauthorized)
+			http.Error(w, `{"error": "Unauthorized"}`, http.StatusUnauthorized)
 			return
 		}
 
@@ -323,108 +342,125 @@ func googleAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// Token refresh endpoint
-func handleRefreshToken(w http.ResponseWriter, r *http.Request) {
-	// Get refresh token from cookie
-	refreshCookie, err := r.Cookie("google_refresh_token")
-	if err != nil {
-		http.Error(w, `{"error": "No refresh token"}`, http.StatusUnauthorized)
-		return
-	}
+// Token refresh endpoint. Email/password sessions are extended in place.
+// Google sessions still exchange the refresh token with Google.
+func handleRefreshToken(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if refreshPasswordSession(db, w, r) {
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]string{
+				"message": "Token refreshed successfully",
+			})
+			return
+		}
 
-	// Use Google's OAuth2 library to refresh the token
-	token := &oauth2.Token{
-		RefreshToken: refreshCookie.Value,
-	}
+		// Get refresh token from cookie
+		refreshCookie, err := r.Cookie("google_refresh_token")
+		if err != nil {
+			http.Error(w, `{"error": "No refresh token"}`, http.StatusUnauthorized)
+			return
+		}
 
-	// Get new token from Google
-	tokenSource := conf.TokenSource(context.Background(), token)
-	newToken, err := tokenSource.Token()
-	if err != nil {
-		log.Printf("Error refreshing token: %v", err)
-		http.Error(w, `{"error": "Failed to refresh token"}`, http.StatusUnauthorized)
-		return
-	}
+		// Use Google's OAuth2 library to refresh the token
+		token := &oauth2.Token{
+			RefreshToken: refreshCookie.Value,
+		}
 
-	// Set new access token cookie
-	http.SetCookie(w, &http.Cookie{
-		Name:     "google_access_token",
-		Value:    newToken.AccessToken,
-		Path:     "/",
-		MaxAge:   3600,
-		HttpOnly: true,
-		Secure:   false,
-		SameSite: http.SameSiteLaxMode,
-	})
+		// Get new token from Google
+		tokenSource := conf.TokenSource(context.Background(), token)
+		newToken, err := tokenSource.Token()
+		if err != nil {
+			log.Printf("Error refreshing token: %v", err)
+			http.Error(w, `{"error": "Failed to refresh token"}`, http.StatusUnauthorized)
+			return
+		}
 
-	// Google may return a new refresh token - update it if provided
-	if newToken.RefreshToken != "" {
-		log.Printf("New refresh token: %s", newToken.RefreshToken)
+		// Set new access token cookie
 		http.SetCookie(w, &http.Cookie{
-			Name:     "google_refresh_token",
-			Value:    newToken.RefreshToken,
+			Name:     "google_access_token",
+			Value:    newToken.AccessToken,
 			Path:     "/",
-			MaxAge:   2592000,
+			MaxAge:   3600,
 			HttpOnly: true,
 			Secure:   false,
 			SameSite: http.SameSiteLaxMode,
 		})
-		log.Printf("Refresh token also updated")
+
+		// Google may return a new refresh token - update it if provided
+		if newToken.RefreshToken != "" {
+			log.Printf("New refresh token: %s", newToken.RefreshToken)
+			http.SetCookie(w, &http.Cookie{
+				Name:     "google_refresh_token",
+				Value:    newToken.RefreshToken,
+				Path:     "/",
+				MaxAge:   2592000,
+				HttpOnly: true,
+				Secure:   false,
+				SameSite: http.SameSiteLaxMode,
+			})
+			log.Printf("Refresh token also updated")
+		}
+
+		log.Printf("Token refreshed successfully")
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{
+			"message": "Token refreshed successfully",
+		})
 	}
-
-	log.Printf("Token refreshed successfully")
-
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{
-		"message": "Token refreshed successfully",
-	})
 }
 
 // Logout endpoint
-func handleLogout(w http.ResponseWriter, r *http.Request) {
-	// Get access token to revoke it with Google (optional but recommended)
-	accessCookie, _ := r.Cookie("google_access_token")
+func handleLogout(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		deletePasswordSession(db, r)
 
-	if accessCookie != nil {
-		// Revoke token with Google
-		revokeURL := fmt.Sprintf("https://oauth2.googleapis.com/revoke?token=%s", accessCookie.Value)
-		resp, err := http.Post(revokeURL, "application/x-www-form-urlencoded", nil)
-		if err == nil {
-			resp.Body.Close()
-			log.Printf("Token revoked with Google")
+		// Get access token to revoke it with Google (optional but recommended)
+		accessCookie, _ := r.Cookie("google_access_token")
+
+		if accessCookie != nil {
+			// Revoke token with Google
+			revokeURL := fmt.Sprintf("https://oauth2.googleapis.com/revoke?token=%s", accessCookie.Value)
+			resp, err := http.Post(revokeURL, "application/x-www-form-urlencoded", nil)
+			if err == nil {
+				resp.Body.Close()
+				log.Printf("Token revoked with Google")
+			}
 		}
+
+		// Clear all auth cookies
+		clearSessionCookie(w)
+
+		http.SetCookie(w, &http.Cookie{
+			Name:     "google_access_token",
+			Value:    "",
+			Path:     "/",
+			MaxAge:   -1,
+			HttpOnly: true,
+		})
+
+		http.SetCookie(w, &http.Cookie{
+			Name:     "google_refresh_token",
+			Value:    "",
+			Path:     "/",
+			MaxAge:   -1,
+			HttpOnly: true,
+		})
+
+		http.SetCookie(w, &http.Cookie{
+			Name:   "user_email",
+			Value:  "",
+			Path:   "/",
+			MaxAge: -1,
+		})
+
+		log.Printf("models.User logged out successfully")
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{
+			"message": "Logged out successfully",
+		})
 	}
-
-	// Clear all auth cookies
-	http.SetCookie(w, &http.Cookie{
-		Name:     "google_access_token",
-		Value:    "",
-		Path:     "/",
-		MaxAge:   -1,
-		HttpOnly: true,
-	})
-
-	http.SetCookie(w, &http.Cookie{
-		Name:     "google_refresh_token",
-		Value:    "",
-		Path:     "/",
-		MaxAge:   -1,
-		HttpOnly: true,
-	})
-
-	http.SetCookie(w, &http.Cookie{
-		Name:   "user_email",
-		Value:  "",
-		Path:   "/",
-		MaxAge: -1,
-	})
-
-	log.Printf("models.User logged out successfully")
-
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{
-		"message": "Logged out successfully",
-	})
 }
 
 func enableCORS(next http.Handler) http.Handler {
