@@ -179,7 +179,10 @@ func handleGoogleCallback(w http.ResponseWriter, r *http.Request) {
 	code := r.URL.Query().Get("code")
 
 	// Exchange code for token (includes access_token and refresh_token)
-	token, err := conf.Exchange(context.Background(), code)
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	token, err := conf.Exchange(ctx, code)
 	if err != nil {
 		log.Printf("Error exchanging code for token: %v", err)
 		frontendURL := getFrontendURL()
